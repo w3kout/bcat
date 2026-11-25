@@ -1,0 +1,308 @@
+
+#!/usr/bin/env bash
+set -u
+
+BCAT_DIR="$HOME/.bcat"
+WANT_ZSH=0
+WANT_FISH=0
+
+for arg in "$@"; do
+  case "$arg" in
+    --zsh) WANT_ZSH=1 ;;
+    --fish) WANT_FISH=1 ;;
+    --all) WANT_ZSH=1; WANT_FISH=1 ;;
+    -h|--help) echo "Usage: bash install.sh [--zsh] [--fish] [--all]"; exit 0 ;;
+    *) echo "Unknown option: $arg"; exit 1 ;;
+  esac
+done
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+is_termux() { [ -n "${TERMUX_VERSION:-}" ] || [ -d /data/data/com.termux ]; }
+
+detect_pm() {
+  if is_termux; then echo pkg
+  elif [ "$(uname -s)" = "Darwin" ]; then
+    if have brew; then echo brew; else echo none; fi
+  elif have apt-get; then echo apt
+  elif have pacman; then echo pacman
+  elif have dnf; then echo dnf
+  elif have zypper; then echo zypper
+  elif have apk; then echo apk
+  else echo none
+  fi
+}
+
+PM="$(detect_pm)"
+SUDO=""
+if [ "$PM" != "pkg" ] && [ "$PM" != "brew" ] && [ "$(id -u)" -ne 0 ] && have sudo; then
+  SUDO="sudo"
+fi
+
+if is_termux; then
+  BIN_DIR="${PREFIX:-/data/data/com.termux/files/usr}/bin"
+else
+  BIN_DIR="$HOME/.local/bin"
+fi
+
+BCAT_SRC=""
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+  src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [ -f "$src/bcat.py" ]; then BCAT_SRC="$src"; fi
+fi
+
+export PM SUDO BCAT_DIR BIN_DIR BCAT_SRC WANT_ZSH WANT_FISH
+export DEBIAN_FRONTEND=noninteractive
+
+RUNNER=""
+
+setup_runner() {
+  RUNNER="$(mktemp)"
+  cat > "$RUNNER" <<'PY'
+import subprocess
+import sys
+from rich.console import Console
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
+
+label, log, cmd = sys.argv[1], sys.argv[2], sys.argv[3]
+console = Console()
+with open(log, "w") as fh:
+    with Progress(
+        SpinnerColumn(style="bright_cyan"),
+        TextColumn("[bold bright_white]{task.description}"),
+        BarColumn(bar_width=30, complete_style="bright_cyan", finished_style="green"),
+        console=console,
+    ) as progress:
+        task = progress.add_task(label, total=None)
+        rc = subprocess.call(["bash", "-c", cmd], stdout=fh, stderr=subprocess.STDOUT)
+        progress.update(task, total=1, completed=1)
+        mark = "[green][+] Ok[/]  " if rc == 0 else "[red][x] Failed[/]  "
+        progress.update(task, description=mark + label)
+sys.exit(rc)
+PY
+}
+
+cleanup() {
+  [ -n "$RUNNER" ] && rm -f "$RUNNER"
+}
+trap cleanup EXIT
+
+run_step() {
+  local label="$1" cmd="$2" log rc
+  log="$(mktemp)"
+  if [ -n "$RUNNER" ] && python3 -c "import rich" >/dev/null 2>&1; then
+    python3 "$RUNNER" "$label" "$log" "$cmd"
+    rc=$?
+  else
+    printf '[*] %s\n' "$label"
+    bash -c "$cmd" >"$log" 2>&1
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+      printf '[+] Ok  %s\n' "$label"
+    else
+      printf '[x] Failed  %s\n' "$label"
+    fi
+  fi
+  if [ "$rc" -ne 0 ]; then
+    echo "--- last lines of output ---"
+    tail -n 15 "$log"
+  fi
+  rm -f "$log"
+  return "$rc"
+}
+
+run_fn() {
+  local label="$1" fn="$2"
+  run_step "$label" "$(declare -f); $fn"
+}
+
+fn_update() {
+  case "$PM" in
+    pkg) pkg update -y ;;
+    apt) $SUDO apt-get update ;;
+    pacman) $SUDO pacman -Sy --noconfirm ;;
+    dnf) $SUDO dnf makecache -y ;;
+    zypper) $SUDO zypper --non-interactive refresh ;;
+    apk) $SUDO apk update ;;
+    brew) brew update ;;
+  esac
+}
+
+fn_python_base() {
+  local pkgs
+  case "$PM" in
+    pkg) pkgs="python python-cryptography" ;;
+    apt) pkgs="python3 python3-pip" ;;
+    pacman) pkgs="python python-pip" ;;
+    dnf) pkgs="python3 python3-pip" ;;
+    zypper) pkgs="python3 python3-pip" ;;
+    apk) pkgs="python3 py3-pip" ;;
+    brew) pkgs="python" ;;
+  esac
+  case "$PM" in
+    pkg) pkg install -y $pkgs ;;
+    apt) $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs ;;
+    pacman) $SUDO pacman -S --needed --noconfirm $pkgs ;;
+    dnf) $SUDO dnf install -y $pkgs ;;
+    zypper) $SUDO zypper --non-interactive install $pkgs ;;
+    apk) $SUDO apk add $pkgs ;;
+    brew) brew install $pkgs ;;
+  esac
+}
+
+fn_python_libs() {
+  python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
+  python3 -m pip install -q rich pyfiglet \
+    || python3 -m pip install -q --user rich pyfiglet \
+    || python3 -m pip install -q --break-system-packages rich pyfiglet \
+    || python3 -m pip install -q --user --break-system-packages rich pyfiglet
+  python3 -c "import rich, pyfiglet"
+}
+
+fn_packages() {
+  local pkgs="curl unzip"
+  case "$PM" in
+    apt|dnf|zypper|pacman|apk) pkgs="$pkgs fontconfig" ;;
+  esac
+  if [ "$WANT_ZSH" -eq 1 ]; then pkgs="$pkgs zsh"; fi
+  if [ "$WANT_FISH" -eq 1 ]; then pkgs="$pkgs fish"; fi
+  case "$PM" in
+    pkg) pkg install -y $pkgs ;;
+    apt) $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs ;;
+    pacman) $SUDO pacman -S --needed --noconfirm $pkgs ;;
+    dnf) $SUDO dnf install -y $pkgs ;;
+    zypper) $SUDO zypper --non-interactive install $pkgs ;;
+    apk) $SUDO apk add $pkgs ;;
+    brew) brew install $pkgs ;;
+  esac
+}
+
+fn_eza() {
+  if command -v eza >/dev/null 2>&1; then return 0; fi
+  case "$PM" in
+    pkg) pkg install -y eza ;;
+    apt) $SUDO apt install -y eza ;;
+    pacman) $SUDO pacman -S --needed --noconfirm eza ;;
+    dnf) $SUDO dnf install -y eza ;;
+    zypper) $SUDO zypper --non-interactive install eza ;;
+    apk) $SUDO apk add eza ;;
+    brew) brew install eza ;;
+  esac
+  if ! command -v eza >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
+    cargo install eza
+  fi
+  command -v eza >/dev/null 2>&1
+}
+
+fn_bcat() {
+  if [ -z "$BCAT_SRC" ] || [ ! -f "$BCAT_SRC/bcat.py" ]; then
+    echo "[x] bcat.py not found beside install.sh"
+    return 1
+  fi
+
+  mkdir -p "$BCAT_DIR/.banner" || return 1
+
+  cp "$BCAT_SRC/bcat.py" "$BCAT_DIR/bcat.py" || return 1
+  printf '%s' "$BCAT_SRC" > "$BCAT_DIR/source_dir" || return 1
+
+  if [ -d "$BCAT_SRC/.banner" ]; then
+    cp -n "$BCAT_SRC"/.banner/*.txt "$BCAT_DIR/.banner/" 2>/dev/null || true
+  fi
+
+  mkdir -p "$BIN_DIR" || return 1
+  printf '#!/usr/bin/env bash\nexec python3 "%s" "$@"\n' "$BCAT_DIR/bcat.py" > "$BIN_DIR/bcat" || return 1
+  chmod +x "$BIN_DIR/bcat"
+}
+
+fn_path() {
+  if is_termux; then return 0; fi
+  local rc
+  for rc in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    if [ "$rc" != "$HOME/.bashrc" ] && [ ! -f "$rc" ]; then continue; fi
+    touch "$rc" || return 1
+    if ! grep -qF 'BCAT MANAGED START' "$rc"; then
+      {
+        printf '\n# >>> BCAT MANAGED START >>>\n'
+        printf 'case ":$PATH:" in *":$HOME/.local/bin:"*) ;; *) export PATH="$HOME/.local/bin:$PATH" ;; esac\n'
+        printf '# <<< BCAT MANAGED END <<<\n'
+      } >> "$rc"
+    fi
+  done
+}
+
+setup_runner
+
+python3 - <<'PY'
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
+
+console = Console()
+
+banner = Text()
+banner.append("Requirements", style="bold bright_white")
+
+console.print()
+console.print(Panel.fit(
+    banner,
+    border_style="bright_cyan",
+    padding=(0, 2)
+))
+PY
+
+python3 - <<'PY'
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
+
+console = Console()
+info = Text()
+info.append("Installer  ", style="bold bright_white")
+info.append("·  ", style="bright_black")
+info.append("Coded By ", style="bright_white")
+info.append("W3kout\n", style="bold bright_cyan")
+info.append("Package manager  ", style="bold bright_white")
+info.append("»  ", style="bright_black")
+info.append(__import__("os").environ.get("PM", "unknown"), style="bold bright_cyan")
+
+console.print(Panel.fit(info, border_style="bright_blue", padding=(0, 2)))
+console.print()
+PY
+
+if [ "$PM" = "none" ]; then
+  echo "No supported package manager found (apt, pacman, dnf, zypper, apk, pkg, brew)."
+  exit 1
+fi
+
+if [ -n "$SUDO" ]; then
+  sudo -v || { echo "sudo authentication failed."; exit 1; }
+fi
+
+run_fn "Updating package index" fn_update || true
+run_fn "Installing Python" fn_python_base || { echo "[x] Python installation failed."; exit 1; }
+run_fn "Installing Python libraries (rich, pyfiglet)" fn_python_libs \
+  || { echo "[x] Could not install rich and pyfiglet."; exit 1; }
+run_fn "Installing system packages" fn_packages || echo "[!] Some system packages failed, continuing."
+run_fn "Installing eza" fn_eza || echo "[!] eza is not available. Use option 07 inside bcat later."
+run_fn "Installing BCAT" fn_bcat || { echo "[x] BCAT installation failed."; exit 1; }
+run_fn "Configuring PATH" fn_path || true
+
+python3 - <<'PY'
+from rich.console import Console
+from rich.panel import Panel
+from rich.text import Text
+
+console = Console()
+
+message = Text()
+message.append("[+] Done ", style="bold green")
+message.append("Now Type ", style="bold white")
+message.append("bcat", style="bold bright_cyan")
+
+console.print()
+console.print(Panel.fit(
+    message,
+    border_style="bright_red",
+    padding=(0, 2)
+))
+PY
