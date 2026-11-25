@@ -14,9 +14,22 @@ for arg in "$@"; do
     --fish) WANT_FISH=1 ;;
     --all) WANT_ZSH=1; WANT_FISH=1 ;;
     -h|--help) echo "Usage: bash install [--zsh] [--fish] [--all]"; exit 0 ;;
-    *) echo "Unknown option: $arg"; exit 1 ;;
+    *) printf '\033[1;31m[x] Unknown option: %s\033[0m\n' "$arg"; exit 1 ;;
   esac
 done
+
+RED='\033[1;31m'
+GREEN='\033[1;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[1;36m'
+WHITE='\033[1;37m'
+GRAY='\033[1;90m'
+RESET='\033[0m'
+
+info() { printf "${CYAN}[*]${RESET} %s\n" "$1"; }
+success() { printf "${GREEN}[+]${RESET} %s\n" "$1"; }
+warning() { printf "${YELLOW}[!]${RESET} %s\n" "$1"; }
+error() { printf "${RED}[x]${RESET} %s\n" "$1"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -60,93 +73,18 @@ fi
 export PM SUDO BCAT_DIR BIN_DIR BCAT_SRC WANT_ZSH WANT_FISH
 export DEBIAN_FRONTEND=noninteractive
 
-RUNNER=""
-
-setup_runner() {
-  RUNNER="$(mktemp)"
-  cat > "$RUNNER" <<'PY'
-import subprocess
-import sys
-from rich.console import Console
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
-
-label, log, cmd = sys.argv[1], sys.argv[2], sys.argv[3]
-console = Console()
-
-with open(log, "w") as fh:
-    with Progress(
-        SpinnerColumn(style="bright_cyan"),
-        TextColumn("[bold bright_white]{task.description}"),
-        BarColumn(bar_width=30, complete_style="bright_cyan", finished_style="green"),
-        TimeElapsedColumn(),
-        console=console,
-        refresh_per_second=10
-    ) as progress:
-        task = progress.add_task(label, total=None)
-        rc = subprocess.call(["bash", "-c", cmd], stdout=fh, stderr=subprocess.STDOUT)
-        progress.update(task, total=1, completed=1)
-        mark = "[bold green][+] DONE[/]" if rc == 0 else "[bold red][x] FAILED[/]"
-        progress.update(task, description=f"{mark} {label}")
-
-sys.exit(rc)
-PY
-}
-
-cleanup() {
-  [ -n "$RUNNER" ] && rm -f "$RUNNER"
-}
-
-trap cleanup EXIT
-
-run_step() {
-  local label="$1" cmd="$2" log rc start elapsed spin i
-
-  log="$(mktemp)"
-  start="$(date +%s)"
-
-  if [ -n "$RUNNER" ] && command -v python3 >/dev/null 2>&1 && python3 -c "import rich" >/dev/null 2>&1; then
-    python3 "$RUNNER" "$label" "$log" "$cmd"
-    rc=$?
-  else
-    printf '\033[1;36m[*]\033[0m %s\n' "$label"
-
-    bash -c "$cmd" >"$log" 2>&1 &
-    local pid=$!
-
-    spin='|/-\'
-    i=0
-
-    while kill -0 "$pid" 2>/dev/null; do
-      elapsed=$(( $(date +%s) - start ))
-      printf '\r\033[1;36m[%c]\033[0m %s \033[90m%ss\033[0m' "${spin:i%4:1}" "$label" "$elapsed"
-      i=$((i + 1))
-      sleep 0.12
-    done
-
-    wait "$pid"
-    rc=$?
-
-    elapsed=$(( $(date +%s) - start ))
-
-    if [ "$rc" -eq 0 ]; then
-      printf '\r\033[1;32m[+] DONE\033[0m %s \033[90m%ss\033[0m\n' "$label" "$elapsed"
-    else
-      printf '\r\033[1;31m[x] FAILED\033[0m %s \033[90m%ss\033[0m\n' "$label" "$elapsed"
-    fi
-  fi
-
-  if [ "$rc" -ne 0 ]; then
-    printf '\033[1;31m--- Last lines of output ---\033[0m\n'
-    tail -n 15 "$log"
-  fi
-
-  rm -f "$log"
-  return "$rc"
-}
-
 run_fn() {
-  local label="$1" fn="$2"
-  run_step "$label" "$(declare -f); $fn"
+  local label="$1"
+  local fn="$2"
+
+  info "$label"
+  if "$fn"; then
+    success "$label completed."
+    return 0
+  else
+    error "$label failed."
+    return 1
+  fi
 }
 
 fn_update() {
@@ -162,38 +100,16 @@ fn_update() {
 }
 
 fn_python_base() {
-  local pkgs
-
   case "$PM" in
-    pkg) pkgs="python python-cryptography" ;;
-    apt) pkgs="python3 python3-pip" ;;
-    pacman) pkgs="python python-pip" ;;
-    dnf) pkgs="python3 python3-pip" ;;
-    zypper) pkgs="python3 python3-pip" ;;
-    apk) pkgs="python3 py3-pip" ;;
-    brew) pkgs="python" ;;
+    pkg) pkg install -y python python-cryptography ;;
+    apt) $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y python3 python3-pip ;;
+    pacman) $SUDO pacman -S --needed --noconfirm python python-pip ;;
+    dnf) $SUDO dnf install -y python3 python3-pip ;;
+    zypper) $SUDO zypper --non-interactive install python3 python3-pip ;;
+    apk) $SUDO apk add python3 py3-pip ;;
+    brew) brew install python ;;
+    *) return 1 ;;
   esac
-
-  case "$PM" in
-    pkg) pkg install -y $pkgs ;;
-    apt) $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y $pkgs ;;
-    pacman) $SUDO pacman -S --needed --noconfirm $pkgs ;;
-    dnf) $SUDO dnf install -y $pkgs ;;
-    zypper) $SUDO zypper --non-interactive install $pkgs ;;
-    apk) $SUDO apk add $pkgs ;;
-    brew) brew install $pkgs ;;
-  esac
-}
-
-fn_python_libs() {
-  python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
-
-  python3 -m pip install -q rich pyfiglet \
-    || python3 -m pip install -q --user rich pyfiglet \
-    || python3 -m pip install -q --break-system-packages rich pyfiglet \
-    || python3 -m pip install -q --user --break-system-packages rich pyfiglet
-
-  python3 -c "import rich, pyfiglet"
 }
 
 fn_packages() {
@@ -214,11 +130,12 @@ fn_packages() {
     zypper) $SUDO zypper --non-interactive install $pkgs ;;
     apk) $SUDO apk add $pkgs ;;
     brew) brew install $pkgs ;;
+    *) return 1 ;;
   esac
 }
 
 fn_eza() {
-  if command -v eza >/dev/null 2>&1; then return 0; fi
+  if have eza; then return 0; fi
 
   case "$PM" in
     pkg) pkg install -y eza ;;
@@ -228,18 +145,15 @@ fn_eza() {
     zypper) $SUDO zypper --non-interactive install eza ;;
     apk) $SUDO apk add eza ;;
     brew) brew install eza ;;
+    *) return 1 ;;
   esac
 
-  if ! command -v eza >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1; then
-    cargo install eza
-  fi
-
-  command -v eza >/dev/null 2>&1
+  have eza
 }
 
 fn_bcat() {
   if [ -z "$BCAT_SRC" ] || [ ! -f "$BCAT_SRC/bcat.py" ]; then
-    printf '\033[1;31m[x] bcat.py not found beside install\033[0m\n'
+    error "bcat.py not found beside install."
     return 1
   fi
 
@@ -274,62 +188,42 @@ fn_path() {
 }
 
 if [ "$PM" = "none" ]; then
-  printf '\033[1;31m[x] No supported package manager found.\033[0m\n'
+  error "No supported package manager found."
   exit 1
 fi
 
 if [ -n "$SUDO" ]; then
-  sudo -v || { printf '\033[1;31m[x] sudo authentication failed.\033[0m\n'; exit 1; }
+  sudo -v || { error "sudo authentication failed."; exit 1; }
 fi
 
-printf '\033[1;36m'
+printf "${CYAN}"
 printf ' ____   ____    _  _____\n'
-printf '| __ ) / ___|  / \|_   _|\n'
-printf '|  _ \| |     / _ \ | |\n'
-printf '| |_) | |___ / ___ \| |\n'
-printf '|____/ \____/_/   \_\_|\n'
-printf '\033[0m'
-printf '\033[1;37mBCAT INSTALLER\033[0m\n'
-printf '\033[1;90mDeveloped by W3kout\033[0m\n'
-printf '\033[1;36mPackage manager:\033[0m %s\n\n' "$PM"
+printf '| __ ) / ___|  / \\|_   _|\n'
+printf '|  _ \\| |     / _ \\ | |\n'
+printf '| |_) | |___ / ___ \\| |\n'
+printf '|____/ \\____/_/   \\_\\_| \n'
+printf "${RESET}"
+printf "${WHITE}BCAT INSTALLER${RESET}\n"
+printf "${GRAY}Developed by W3kout${RESET}\n"
+printf "${CYAN}Package manager:${RESET} %s\n\n' "$PM"
 
-setup_runner
+run_fn "Updating package index" fn_update || exit 1
 
-run_fn "Updating package index" fn_update || true
+run_fn "Installing Python" fn_python_base || exit 1
 
-run_fn "Installing Python" fn_python_base \
-  || { printf '\033[1;31m[x] Python installation failed.\033[0m\n'; exit 1; }
-
-if ! command -v python3 >/dev/null 2>&1; then
-  printf '\033[1;31m[x] Python 3 was not found after installation.\033[0m\n'
+if ! have python3; then
+  error "Python 3 was not found after installation."
   exit 1
 fi
 
-run_fn "Installing Python libraries (rich, pyfiglet)" fn_python_libs \
-  || { printf '\033[1;31m[x] Could not install rich and pyfiglet.\033[0m\n'; exit 1; }
+run_fn "Installing system packages" fn_packages || warning "Some system packages failed."
 
-run_fn "Installing system packages" fn_packages \
-  || printf '\033[1;33m[!] Some system packages failed, continuing.\033[0m\n'
+run_fn "Installing eza" fn_eza || warning "eza is not available. Use option 07 inside bcat later."
 
-run_fn "Installing eza" fn_eza \
-  || printf '\033[1;33m[!] eza is not available. Use option 07 inside bcat later.\033[0m\n'
+run_fn "Installing BCAT" fn_bcat || exit 1
 
-run_fn "Installing BCAT" fn_bcat \
-  || { printf '\033[1;31m[x] BCAT installation failed.\033[0m\n'; exit 1; }
+run_fn "Configuring PATH" fn_path || warning "Could not configure PATH automatically."
 
-run_fn "Configuring PATH" fn_path || true
-
-python3 - <<'PY'
-from rich.console import Console
-from rich.panel import Panel
-from rich.text import Text
-
-console = Console()
-message = Text()
-message.append("[+] Done ", style="bold green")
-message.append("Now Type ", style="bold white")
-message.append("bcat", style="bold bright_cyan")
-
-console.print()
-console.print(Panel.fit(message, border_style="bright_red", padding=(0, 2)))
-PY
+printf '\n'
+success "BCAT installation completed."
+printf "${WHITE}Now Type ${CYAN}bcat${RESET}\n"
