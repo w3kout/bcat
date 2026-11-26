@@ -47,7 +47,7 @@ Run the following commands in Termux (use the copy icon at the top-right of the 
 ```bash
 pkg update -y && pkg upgrade -y
 pkg install git -y
-git clone https://github.com/w3kout/Bcat.git bcat
+git clone https://github.com/w3kout/bcat.git bcat
 cd bcat
 bash install
 ```
